@@ -1,0 +1,4 @@
+To run systemd in a container, the following needs to be added to docker-run
+(docker_run_options parameter in recipe file):
+
+--cap-add=SYS_ADMIN --security-opt=seccomp:unconfined -v /sys/fs/cgroup:/sys/fs/cgroup:ro -e container=docker

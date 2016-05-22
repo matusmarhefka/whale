@@ -1,0 +1,27 @@
+#!/bin/bash
+
+set -x
+
+if [ "$1" == "build" ]; then
+	docker build -t xmlrpc_server $(dirname $0) || exit $?
+elif [ "$1" == "run" ]; then
+	# first start data container for xmlrpc_db if it isn't already running
+	docker ps -a --format "{{.Names}}" | grep "xmlrpc_db-data" >/dev/null
+	if [ $? -ne 0 ]; then
+		docker create --name xmlrpc_db-data -v /var/lib/mysql mariadb
+	fi
+	docker run -d --name xmlrpc_db --expose=3306 \
+		--volumes-from xmlrpc_db-data \
+		-e "MYSQL_ROOT_PASSWORD=pass" -e "MYSQL_DATABASE=accounts" \
+		mariadb || exit $?
+	docker run -dt --name xmlrpc_server -p 8000:8000 \
+		--link xmlrpc_db:mariadb xmlrpc_server || exit $?
+elif [ "$1" == "rm" ]; then
+	docker rm -f xmlrpc_server xmlrpc_db
+	if [ "$2" == "all" ]; then
+		data=$(docker inspect -f "{{range .Mounts}}{{.Name}}{{end}}" \
+			xmlrpc_db-data)
+		docker rm -f xmlrpc_db-data
+		docker volume rm $data
+	fi
+fi

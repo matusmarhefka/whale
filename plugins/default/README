@@ -1,0 +1,12 @@
+Basic information:
+==================
+
+  Tests management:    supervisor and test manager script
+     Tests timeout:    yes
+Sequential testing:    yes
+  Parallel testing:    yes
+
+
+Runs tests inside Docker container sequentially or parallely. The implementation
+also provides tests timeouting. Tests and the tested application run in the same
+container.

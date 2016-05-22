@@ -1,0 +1,3 @@
+PURPOSE of dfuzzer_systemd
+Description: dfuzzer_systemd test
+Author: Matus Marhefka <mmarhefk@redhat.com>

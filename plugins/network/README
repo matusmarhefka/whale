@@ -1,0 +1,22 @@
+Basic information:
+==================
+
+  Tests management:    supervisor and test manager script
+     Tests timeout:    yes
+Sequential testing:    yes
+  Parallel testing:    yes
+
+
+This implementation runs two containers:
+
+1. Application container - a container with tested application (like httpd);
+   this container should provide some network service and must export port/ports
+   on which it does so.
+2. Test container - a container for running tests against the application
+   container (with the tested application); the test container should be based
+   on some GNU/Linux distribution with package manager for easy installation
+   of all the required dependencies.
+
+Tests inside the test container are timeouted and they can also use environment
+variables ($AC_ADDR, $AC_PORT) which are exported automatically inside the test
+container and are referring to the application container.

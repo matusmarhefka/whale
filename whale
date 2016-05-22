@@ -1,0 +1,1105 @@
+#!/bin/bash
+#
+# whale -- the framework for testing software running in Docker containers.
+# Copyright (C) 2016, Red Hat, Inc., Matus Marhefka <mmarhefk@redhat.com>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#
+# DESCRIPTION:
+# ============
+# Whale is the framework for testing software running in Docker containers.
+# The framework consists of the core module which provides basic functionality
+# and it is designed to be extendable with an additional custom code in form
+# of a plugin.
+#
+# The core module of the framework is providing helper functions for the plugin
+# code, including functions for creating and parsing configuration files or
+# functions for exclusive access to the main framework configuration file.
+#
+#===============================================================================
+
+ME=$(basename "$0")
+TEST_CONF="test.ini"
+
+# File which stores information about plugin directory location (first line),
+# images and their corresponding containers. Format (spaces are used as
+# delimeters for the image entries):
+# /absolute/path/to/plugin_directory
+# test_image_name   XMB    /absolute/path/to/recipe_file
+# base_image_name   YMB    -
+# ...
+# Always use lock/unlock functions when writing to this file as more instances
+# of $ME can run at once.
+WHALE_CONF_DIR="$HOME/.config/$ME"
+WHALE_CONF="$WHALE_CONF_DIR/config"
+
+# General label used for all the containers started by $ME. Must be set when
+# running a new container:
+# docker run -l "$WHALE_LABEL" ...
+WHALE_LABEL="com.whale.name=test"
+# Image label used for all the containers started by $ME to identify the image
+# which the container was started from. Must be set when running a new
+# container:
+# docker run -l "$WHALE_IMG_LABEL=IMAGE_NAME" ...
+WHALE_IMG_LABEL="com.whale.image"
+
+# Locking file and file descriptor for lock/unlock functions.
+WHALE_LOCK_FILE="/tmp/$ME.lock"
+WHALE_LOCK_FD="1000"
+
+# Saves the current tty flags. If required, plugin code should restore tty flags
+# on unexpected exit (i.e. on trapping SIGINT or other signals) by calling:
+# stty $TTY_FLAGS
+TTY_FLAGS=$(stty -g)
+#===============================================================================
+
+# Plugin must declare the following functions:
+PLUGIN_HELP="plugin_print_help"
+PLUGIN_SETUP="plugin_setup"
+PLUGIN_RUN="plugin_run"
+PLUGIN_STATUS="plugin_status"
+#===============================================================================
+
+# Plugin can redefine trap cleanup function, otherwise whale_trap_cleanup
+# will be used by default for signals EXIT, SIGHUP, SIGINT and SIGTERM.
+whale_trap_cleanup() {
+	rv=$?
+	unlock 2>/dev/null
+
+	docker rmi -f $(docker images | grep "^<none>" | awk '{print $3}') >/dev/null 2>&1
+	docker rm -f $(docker ps -aq -f exited=137) >/dev/null 2>&1
+
+	# Restores tty flags.
+	stty $TTY_FLAGS 2>/dev/null
+
+	exit $rv
+}
+trap whale_trap_cleanup EXIT SIGHUP SIGINT SIGTERM || exit $?
+#===============================================================================
+
+# Standard printf, but prints on the stderr instead.
+eprintf() {
+	printf "$@" 1>&2
+}
+#===============================================================================
+
+# Wrapper function for running commands. It will also print error message when
+# command exits with non 0 status.
+# Usage:
+#     cmd COMMAND [ARGS]
+# Returns the exit status of COMMAND.
+cmd() {
+	"$@"
+	local status=$?
+	if [ $status -ne 0 ]; then
+		eprintf "Error: $1\n"
+	fi
+
+	return $status
+}
+#===============================================================================
+
+# Prints the number of running instances with the name $1 to the stdout.
+# Returns 0 on success, 1 on error.
+number_of_instances() {
+	if [ -z "$1" ]; then
+		eprintf "number_of_instances NAME\n"
+		return 1
+	fi
+
+	ps -eo "pgid,cmd" | grep -v "grep" | grep "bash.*$1" \
+		| awk '{print $1}' | sort -u | wc -w
+
+	return 0
+}
+#===============================================================================
+
+# Obtains an exclusive lock on $WHALE_LOCK_FD file descriptor of file
+# $WHALE_LOCK_FILE. If the lock cannot be immediately acquired, function blocks
+# and waits for the lock.
+# Returns 0 on success, 1 on error.
+lock() {
+	eval "exec $WHALE_LOCK_FD>$WHALE_LOCK_FILE"
+	if [ $? -ne 0 ]; then
+		eprintf "lock: Unable to set fd '$WHALE_LOCK_FD' to lock file '$WHALE_LOCK_FILE'\n"
+		return 1
+	fi
+
+	flock --exclusive "$WHALE_LOCK_FD"
+	if [ $? -ne 0 ]; then
+		eprintf "lock: Unable to create lock\n"
+		return 1
+	fi
+
+	return 0
+}
+#===============================================================================
+
+# Drops a lock on $WHALE_LOCK_FD file descriptor.
+# Returns 0 on success, 1 on error.
+unlock() {
+	flock --unlock "$WHALE_LOCK_FD"
+	if [ $? -ne 0 ]; then
+		eprintf "unlock: Unable to release lock\n"
+		return 1
+	fi
+
+	return 0
+}
+#===============================================================================
+
+# Gets value of parameter $4 from ini file $2 from section $3. The first
+# argument $1 specifies if the parameter $3 can be empty: if set to false
+# and parameter $3 is empty, function returns error.
+# Prints parameter's value and returns 0 on success, or returns 1 on error.
+ini_get() {
+	if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ]; then
+		eprintf "Error: ini_get CAN_BE_EMPTY CONF_FILE SECTION PARAMETER\n"
+		return 1
+	fi
+
+	case $1 in
+	true|false)
+		;;
+	*)
+		eprintf "Error: First argument must be true|false: ini_get\n"
+		return 1
+		;;
+	esac
+	if [ ! -f "$2" ]; then
+		eprintf "Error: Second argument must be a file: ini_get\n"
+		return 1
+	fi
+
+	local found=0 param="" value="" section=""
+	while read -r line; do
+		line=$(echo "$line" |  sed 's/;.*$//')
+		if [[ $line == "[$3]"* ]]; then
+			section="$3"
+			continue
+		fi
+		if [ "$section" != "$3" ]; then
+			continue
+		fi
+
+		# End of $3 section.
+		if [[ $line == "["*"]"* ]]; then
+			break
+		fi
+
+		if [ -z "$line" ]; then
+			continue
+		else
+			param=$(echo "$line" | sed '0,/=/ s/=/ /' \
+				| awk '{print $1}')
+			value=$(echo "$line" | sed '0,/=/ s/=/ /' \
+				| awk '{$1=""; print $0}' | sed 's/^ *//')
+			if [ "$param" == "$4" ]; then
+				found=1
+				break
+			else
+				value=""
+			fi
+		fi
+	done <"$2"
+
+	echo -n "$value"
+	if [ "$1" == "false" ] && [ $found -eq 0 ]; then
+		eprintf "$2: Parameter not found: $3:$4\n"
+		return 1
+	fi
+	if [ "$1" == "false" ] && [ -z "$value" ]; then
+		eprintf "$2: Parameter must not be empty: $3:$4\n"
+		return 1
+	fi
+
+	return 0
+}
+#===============================================================================
+
+# Prints all the tests inside the provided root directory with tests ($1)
+# in form of relative paths starting from the root directory.
+# Returns 0 on success, 1 on error.
+whale_getall_tests_for_dir() {
+	if [ ! -d "$1" ]; then
+		eprintf "Error: No such directory: $1\n"
+		return 1
+	fi
+
+	dirname $(find $1 -type f) | sort -u | sed "s|$1/||g"
+	return 0
+}
+#===============================================================================
+
+# Prints all the commands of the [environment] section in the configuration
+# file provided as the first argument ($1). Printed output is formatted as
+# the "cmd1; cmd2; ..." string. If there is no commands in the [environment]
+# section, empty string is printed. Returns 0 on success, 1 on error.
+whale_recipe_getall_environment_commands() {
+	local section commands
+	if [ ! -f "$1" ]; then
+		eprintf "Error: No such recipe configuration file: $1\n"
+		return 1
+	fi
+
+	section=""
+	commands=""
+	while read -r line; do
+		line=$(echo "$line" |  sed 's/;.*$//')
+		if [[ $line == "[environment]"* ]]; then
+			section="environment"
+			continue
+		fi
+		if [ "$section" != "environment" ]; then
+			continue
+		fi
+
+		# End of [environment] section.
+		if [[ $line == "["*"]"* ]]; then
+			break
+		fi
+
+		if [ -z "$line" ]; then
+			continue
+		else
+			if [ -z "$commands" ]; then
+				commands="$line"
+			else
+				commands="$commands; $line"
+			fi
+		fi
+	done <"$1"
+
+	printf "$commands"
+	return 0
+}
+#===============================================================================
+
+# Prints all the recipes of the [recipe] section in the configuration file
+# provided as the first argument ($1). If there is no recipes in the [recipe]
+# section, it is error. Returns 0 on success, 1 on error.
+whale_recipe_getall_recipes() {
+	local section recipes
+	if [ ! -f "$1" ]; then
+		eprintf "Error: No such recipe configuration file: $1\n"
+		return 1
+	fi
+
+	section=""
+	recipes=""
+	while read -r line; do
+		line=$(echo "$line" |  sed 's/;.*$//')
+		if [[ $line == "[recipe]"* ]]; then
+			section="recipe"
+			continue
+		fi
+		if [ "$section" != "recipe" ]; then
+			continue
+		fi
+
+		# End of [recipe] section.
+		if [[ $line == "["*"]"* ]]; then
+			break
+		fi
+
+		if [ -z "$line" ]; then
+			continue
+		else
+			if [ -z "$recipes" ]; then
+				recipes="$line"
+			else
+				recipes="$recipes\n$line"
+			fi
+		fi
+	done <"$1"
+
+	if [ -z "$recipes" ]; then
+		eprintf "Error: Empty [recipe] section: $1\n"
+		return 1
+	fi
+
+	printf "$recipes"
+	return 0
+}
+#===============================================================================
+
+# Reads recipe ($1) configuration file [global] section and stores all
+# the parameters into global variables. Returns 0 on success, 1 on error.
+whale_recipe_export_global_conf() {
+	if [ ! -f "$1" ]; then
+		eprintf "Error: No such recipe configuration file: $1\n"
+		return 1
+	fi
+
+	PLUGIN=$(ini_get false $1 global plugin) || return $?
+	TESTS_ROOT_DIR=$(ini_get false $1 global tests_root_dir) || return $?
+	DOCKER_RUN_OPTIONS=$(ini_get true $1 global docker_run_options)
+	DEFAULT_TIMEOUT=$(ini_get false $1 global default_timeout) || return $?
+	PKG_INSTALL=$(ini_get false $1 global pkg_install) || return $?
+	TMP_FILES_CLEANUP=$(ini_get false $1 global tmp_files_cleanup) || return $?
+	DEBUG_PKGS=$(ini_get true $1 global debug_pkgs)
+
+	return 0
+}
+#===============================================================================
+
+# Inserts $1 line as the first line into a file $2.
+file_insert_first_line() {
+	if [ -z "$1" ] || [ -z "$2" ]; then
+		eprintf "file_insert_first_line LINE FILE\n"
+		return 1
+	fi
+
+	if [ -f "$2" ]; then
+		sed -i "1a$1" "$2" || return 1
+	else
+		eprintf "file_insert_first_line: '$2' must be a file\n"
+		return 1
+	fi
+
+	return 0
+}
+#===============================================================================
+
+# Returns the size of a $1 image.
+get_docker_image_size() {
+	if [ -z "$1" ]; then
+		eprintf "get_docker_image_size IMAGE\n"
+		return 1
+	fi
+	local size
+	size=$(docker images | grep "$1" \
+		| sed 's|.* \([0-9]\+.[0-9 ]*.B\)$|\1|' | sed 's/ //')
+
+	echo $size
+	return 0
+}
+#===============================================================================
+
+# Exports .sh files from a directory provided as first argument.
+# Returns 0 on success, 1 on error.
+whale_source_plugin_files() {
+	if [ ! -d "$1" ]; then
+		eprintf "Error: Plugin directory not found: $1\n"
+		return 1
+	fi
+
+	ls $1 | grep "\.sh" >/dev/null
+	if [ $? -ne 0 ]; then
+		eprintf "Error: No .sh files to source: $1\n"
+		return 1
+	fi
+	for f in $1/*.sh; do
+		. $f
+	done
+
+	return 0
+}
+#===============================================================================
+
+# Checks if configuration file $WHALE_CONF exists. If it does exist, sets
+# the plugin directory location into the $PLUGIN_DIR variable.
+# Returns 0 on success, 1 on error.
+whale_export_conf() {
+	if [ ! -f "$WHALE_CONF" ]; then
+		eprintf "Error: Configuration file not found: $WHALE_CONF\n"
+		eprintf "Try running 'make-conf' command first\n"
+		whale_minimal_help
+		return 1
+	fi
+
+	PLUGIN_DIR=$(head -n 1 "$WHALE_CONF") || return $?
+	if [ -z "$PLUGIN_DIR" ]; then
+		eprintf "Error: Empty configuration file: $WHALE_CONF\n"
+		return 1
+	fi
+
+	# Sources plugin files.
+	whale_source_plugin_files "$PLUGIN_DIR" || return $?
+
+	return 0
+}
+#===============================================================================
+
+whale_minimal_help() {
+	printf "  make-conf [--beaker] [TESTS_ROOT_DIR] PLUGIN_DIR
+                        -- Creates configuration file
+                           '$WHALE_CONF'
+                           (if it does not exist) for storing location
+                           of PLUGIN_DIR and information about test images
+                           and containers. If the TESTS_ROOT_DIR is specified,
+                           also creates configuration files '$TEST_CONF'
+                           for each test inside the TESTS_ROOT_DIR - does not
+                           overwrite the existing '$TEST_CONF' files. Option
+                           '--beaker' will use a Beaker test metadata from each
+                           test Makefile to fill its '$TEST_CONF' configuration
+                           file.\n"
+}
+#===============================================================================
+
+# Prints help. You can print plugin specific help by declaring
+# 'plugin_print_help' function inside the plugin specific directory.
+whale_print_help() {
+	whale_export_conf >/dev/null 2>&1
+
+	printf "COMMANDS:\n"
+	whale_minimal_help
+	printf "  info [IMAGE|CONTAINER]
+                        -- If called with one argument - a test image name or
+                           a test container ID, prints available information
+                           about that test image/container. If called without
+                           arguments, prints information about currently
+                           configured plugin and lists all the images and their
+                           containers. Lists only the images and the containers
+                           managed by $ME.\n"
+
+	# Prints plugin specific help.
+	declare -F "$PLUGIN_HELP" >/dev/null
+	if [ $? -eq 0 ]; then
+		$PLUGIN_HELP
+	fi
+
+	printf "  diff CONTAINER        -- Shows changed files in a container compared to its
+                           image (useful after testing to see changed files).
+  analyze CONTAINER     -- Enters the specified container and gives a shell, if
+                           container is not running, tries to start it.
+  save IMAGE ARCHIVE    -- Saves the IMAGE from the local Docker repository
+                           and its recipe configuration file to the compressed
+                           archive ARCHIVE.
+  load ARCHIVE PATH_TO_EXTRACT_RECIPE
+                        -- Loads an image from the compressed archive ARCHIVE
+                           into the local Docker repository and also extracts
+                           its recipe configuration file from the ARCHIVE into
+                           the PATH_TO_EXTRACT_RECIPE location.
+  rm IMAGE|CONTAINER [IMAGE|CONTAINER...]
+                        -- Removes one or more test images including all of
+                           their containers, or removes one or more containers.
+                           Recipe configuration files will not be removed.
+  rm-all all|running    -- Removes either all images and their containers ('all'
+                           argument) or only containers ('running' argument).
+                           Applies only to images and containers which are
+                           managed by $ME. Recipe configuration files will not
+                           be removed.\n"
+}
+#===============================================================================
+
+# Prints a full path to the recipe file provided as the first argument.
+# Returns 0 on success, 1 on error.
+whale_get_image_recipe() {
+	local image_line
+	if [ -z "$1" ]; then
+		eprintf "Error: whale_get_image_recipe IMAGE\n"
+		return 1
+	fi
+
+	lock || return $?
+	image_line=$(tail -n +2 "$WHALE_CONF" | grep "$1 ")
+	if [ $? -ne 0 ]; then
+		eprintf "Error: Image not found: $1\n"
+		return 1
+	fi
+	unlock || return $?
+
+	echo "$image_line" | awk '{print $3}'
+	return 0
+}
+#===============================================================================
+
+# Checks if container provided as the first argument uses the same plugin
+# as $ME is configured with. Returns 0 if it does, otherwise returns 1.
+# Also prints a full path to the recipe file which is used for the container $1.
+whale_check_cont_plugin() {
+	local cmd_exec image recipe
+	if [ -z "$1" ]; then
+		eprintf "Error: plugin_get_cont_recipe CONTAINER\n"
+		return 1
+	fi
+
+	cmd_exec=$(echo "docker inspect -f '{{ index .Config.Labels \"$WHALE_IMG_LABEL\" }}' $1")
+	image=$(eval $cmd_exec)
+	if [ -z "$image" ]; then
+		eprintf "Error: Unknown container: $1\n"
+		return 1
+	fi
+
+	recipe=$(whale_get_image_recipe "$image") || return $?
+	if [ -z "$recipe" ]; then
+		eprintf "Error: No recipe for image: $image\n"
+		return 1
+	elif [ "$recipe" != "-" ]; then
+		# Loads global section parameters from the recipe file.
+		whale_recipe_export_global_conf "$recipe" || return $?
+
+		# Checks if plugin configured in $WHALE_CONF is the same
+		# as in the recipe file ($PLUGIN): if not, error.
+		if [ "$PLUGIN_DIR" != "$PLUGIN" ]; then
+			eprintf "Error: Container '$1' plugin '$PLUGIN'\n"
+			eprintf "differs from the plugin in use.\n"
+			eprintf "To change plugin to the plugin of the container\n"
+			eprintf "run command: 'make-conf $PLUGIN'\n"
+			return 1
+		fi
+		printf "$recipe"
+	fi
+
+	return 0
+}
+#===============================================================================
+
+# Creates configuration files $TEST_CONF for each test directory inside
+# the TESTS_ROOT_DIR - does not overwrite the existing $TEST_CONF files.
+# If the first argument is set to 1, function will use a Beaker test metadata
+# from each test's Makefile to fill its $TEST_CONF file.
+# Returns 0 on success, 1 on error.
+whale_make_test_conf() {
+	local all_tests="" added=0
+	if [ -z "$1" ] || [ ! -d "$2" ]; then
+		eprintf "Error: whale_make_test_conf BEAKER_FLAG TESTS_ROOT_DIR\n"
+		return 1
+	fi
+
+	all_tests=$(dirname $(find "$2" -type f) | sort -u) || return $?
+	for t in $all_tests; do
+		# Do not overwrite existing $TEST_CONF files.
+		if [ -f "$t/$TEST_CONF" ]; then
+			continue
+		else
+			if [ $added -eq 0 ]; then
+				printf "Adding '$TEST_CONF' configuration file for tests:\n"
+				added=1
+			fi
+			printf "$t\n"
+		fi
+
+		local deps="" entrypoint="" timeout="" executable=""
+		executable=$(find "$t" -executable -type f | sed "s|.*/||g")
+
+		# If beaker test, harvest dependencies and timeout form Makefile.
+		if [ $1 -eq 1 ]; then
+			entrypoint="runtest.sh"
+			deps=$(cat "$t/Makefile" | grep "\"Requires:" \
+				| sed 's/.*Requires:[ \t]*\(.*\)\".*$/\1/')
+			timeout=$(cat "$t/Makefile" | grep "\"TestTime:" \
+				| sed 's/.*TestTime:[ \t]*\(.*\)\".*$/\1/')
+		else
+			# If test directory contains only one executable
+			# file, makes it an entrypoint.
+			local count; count=$(echo "$executable" | wc -w)
+			if [ $count -eq 1 ]; then
+				entrypoint=$(echo "$executable" | tr "\n" " " \
+					| sed "s|\(.*\) $|\1|")
+			fi
+		fi
+
+		printf "; Each test directory must provide the testinfo section with its own
+; parameters.
+[testinfo]
+; List of packages with required dependencies for the test.
+; Required: no
+dependencies=$deps
+
+; Specifies the file which will be executed by the test controller
+; as the entrypoint of this test directory inside a test container.
+; Only one file can be specified, including arguments for that file.
+; By default, each test will produce a log file made from the 'entrypoint'
+; file stdout and stderr outputs.
+; Required: yes
+entrypoint=$entrypoint
+
+; Specifies the timeout for the test (same as timeout(1)), when specified
+; time passes test is terminated. When no value is specified, it is set
+; to the default value from the recipe configuration file.
+; Required: no
+timeout=$timeout\n" >"$t/$TEST_CONF"
+	done
+
+	if [ $added -eq 1 ]; then
+		printf "Please complete the configuration files '$TEST_CONF' "
+		printf "inside\nthe '$2' directory (existing '$TEST_CONF' files"
+		printf " were\nnot changed).\n"
+	else
+		printf "All tests in '$2' already have '$TEST_CONF'\nconfiguration files.\n"
+	fi
+
+	return 0
+}
+#===============================================================================
+
+# Creates configuration file $WHALE_CONF (if it does not exist) and prints
+# location of the PLUGIN_DIR on a first line of the file. If the TESTS_ROOT_DIR
+# is specified, also creates configuration files $TEST_CONF for each test inside
+# the TESTS_ROOT_DIR - does not overwrite the existing $TEST_CONF files.
+# Option '--beaker' will use a Beaker test metadata from each test's Makefile
+# to fill its $TEST_CONF file.
+# Usage:
+#     whale_make_conf [--beaker] [TESTS_ROOT_DIR] PLUGIN_DIR
+# Returns 0 on success, 1 on error.
+whale_make_conf() {
+	local beaker_flg=0 tests_root_dir="" plugin_dir=""
+	if [ "$1" == "--beaker" ]; then
+		beaker_flg=1
+		tests_root_dir="$2"
+		plugin_dir="$3"
+		if [ ! -d "$tests_root_dir" ] || [ ! -d "$plugin_dir" ]; then
+			whale_minimal_help
+			return 1
+		fi
+	else
+		if [ -z "$2" ]; then
+			plugin_dir="$1"
+		else
+			tests_root_dir="$1"
+			plugin_dir="$2"
+		fi
+
+		if [ ! -d "$plugin_dir" ]; then
+			whale_minimal_help
+			return 1
+		fi
+	fi
+
+	plugin_dir=$(cd $plugin_dir; pwd)
+	# Tries to source plugin files.
+	whale_source_plugin_files "$plugin_dir" || return $?
+
+	# Creates $WHALE_CONF file for storing location of PLUGIN_DIR
+	# and information about testing images and their corresponding
+	# containers.
+	lock || return $?
+	if [ ! -s "$WHALE_CONF" ]; then
+		cmd mkdir -p "$WHALE_CONF_DIR" || return $?
+		cmd touch "$WHALE_CONF" || return $?
+		printf "$plugin_dir\n" >>"$WHALE_CONF"
+	else
+		# $WHALE_CONF file already exists; replace first line: a plugin
+		# directory location with the provided PLUGIN_DIR.
+		sed -i "1s|.*|$plugin_dir|" "$WHALE_CONF"
+	fi
+	unlock || return $?
+	printf "From now using plugin: $plugin_dir\n"
+
+	if [ -d "$tests_root_dir" ]; then
+		# Creates configuration files $TEST_CONF for each test directory
+		# inside the $tests_root_dir.
+		whale_make_test_conf "$beaker_flg" "$tests_root_dir" || return $?
+	fi
+
+	return 0
+}
+#===============================================================================
+
+# Prints a list of all built images, their sizes, recipes and all the containers
+# started from them on the stdout. Returns 0 on success, 1 on error and 2 when
+# there is no images to list.
+whale_list() {
+	local output rv
+
+	rv=0
+	lock || return $?
+	output=$(tail -n +2 "$WHALE_CONF" 2>/dev/null)
+	if [ -z "$output" ]; then
+		rv=2
+	fi
+	unlock || return $?
+
+	printf "$output"
+	return $rv
+}
+#===============================================================================
+
+# If called with one argument - a test image name or a test container ID, prints
+# available information about that test image/container. If called without
+# arguments, prints information about currently configured plugin and lists
+# all the images and their containers.
+whale_info() {
+	local output cmd_exec image recipe
+	if [ $# -gt 1 ]; then
+		eprintf "Usage: info [IMAGE|CONTAINER]\n"
+		return 1
+	fi
+
+	whale_export_conf || return 1
+
+	if [ -z "$1" ]; then
+		printf "Configured plugin: $(head -n 1 $WHALE_CONF)\n\n"
+		output=$(whale_list)
+		if [ $? -eq 1 ]; then return 1; fi
+		printf "IMAGE SIZE RECIPE\n$output" | column -t
+		printf "\n"
+		docker ps -a --filter "label=$WHALE_LABEL" \
+		--format "table {{.ID}}\t{{.Image}}\t{{.Command}}\t{{.Status}}\t{{.Ports}}"
+	else
+		cmd_exec=$(echo "docker inspect -f '{{ index .Config.Labels \"$WHALE_IMG_LABEL\" }}' $1")
+		image=$(eval $cmd_exec)
+		if [ -z "$image" ]; then
+			image=$1
+		fi
+
+		recipe=$(whale_get_image_recipe "$image") || return $?
+		if [ -z "$recipe" ]; then
+			eprintf "Error: No recipe for image: $image\n"
+			return 1
+		fi
+
+		if [ "$recipe" != "-" ]; then
+			whale_recipe_export_global_conf "$recipe" || return $?
+		fi
+
+		printf "$1:\n"
+		printf "%.0s=" $(seq 1 $(printf "$1:" | wc -c))
+		printf "\nImage:               $image\n"
+		printf "Recipe:              $recipe\n"
+		printf "Plugin:              $PLUGIN\n"
+		printf "Tests root dir:      $TESTS_ROOT_DIR\n"
+		printf "Default timeout:     $DEFAULT_TIMEOUT\n"
+		printf "docker-run options:  $DOCKER_RUN_OPTIONS\n"
+		printf "Debug packages:      $DEBUG_PKGS\n"
+	fi
+
+	return 0
+}
+#===============================================================================
+
+# Wrapper for calling plugin functions.
+# Usage:
+#     whale_call_plugin_function PLUGIN_FUNCTION ARGS_FOR_PLUGIN_FUNCTION
+# On error returns 1, otherwise returns the return value of a plugin function.
+whale_call_plugin_function() {
+	if [ -z "$1" ]; then
+		eprintf "Error: whale_call_plugin_function PLUGIN_FUNCTION ...\n"
+		return 1
+	fi
+	local plugin_fun="$1"
+	shift 1
+
+	whale_export_conf || return 1
+
+	# checks if plugin declares required function
+	declare -F "$plugin_fun" >/dev/null
+	if [ $? -ne 0 ]; then
+		eprintf "Error: Plugin '$PLUGIN' must declare function: $plugin_fun\n"
+	fi
+
+	$plugin_fun "$@"
+	return $?
+}
+#===============================================================================
+
+#
+whale_diff() {
+	local cont output
+	if [ $# -gt 1 ] || [ -z "$1" ]; then
+		eprintf "Usage: diff CONTAINER\n"
+		return 1
+	fi
+
+	cont=$(docker ps -aq --filter "label=$WHALE_LABEL")
+	echo "$cont" | grep "$1" >/dev/null
+	if [ $? -ne 0 ]; then
+		eprintf "Error: No such container: $1\n"
+		return 1
+	fi
+
+	printf "(A: Added, D: Deleted, C: Changed)\n"
+	output=$(docker diff $1) || return $?
+	echo "$output" | grep -Ev "(/tests.*|/supervisor.*)"
+	return 0
+}
+#===============================================================================
+
+# Enters a test container and gives a shell, if the container is not running,
+# tries to start it. Returns 0 on success, 1 on error.
+whale_analyze() {
+	local cont
+	if [ $# -gt 1 ] || [ -z "$1" ]; then
+		eprintf "Usage: analyze CONTAINER\n"
+		return 1
+	fi
+
+	cont=$(docker ps -aq --filter "label=$WHALE_LABEL")
+	echo "$cont" | grep "$1" >/dev/null
+	if [ $? -ne 0 ]; then
+		eprintf "Error: No such container: $1\n"
+		return 1
+	fi
+
+	# If the container is stopped or the tested application crashed,
+	# tries to start it; if it is already running, then it is noop.
+	docker start $1 >/dev/null || return $?
+
+	printf "Entering container $1\nTest files are located in /tests\n"
+	docker exec -it $1 bash
+	return $?
+}
+#===============================================================================
+
+# Saves an image (specified as the first argument $1) from the local Docker
+# repository and its recipe configuration file to the compressed archive
+# specified as the second function argument. Returns 0 on success, 1 on error.
+whale_save() {
+	local recipe temp_dir rv
+	if [ -z "$1" ] || [ -z "$2" ]; then
+		eprintf "Usage: save IMAGE ARCHIVE\n"
+		return 1
+	fi
+
+	docker images | grep "$1" >/dev/null
+	if [ $? -ne 0 ]; then
+		eprintf "Error: No such image: $1\n"
+		return 1
+	fi
+
+	recipe=$(whale_get_image_recipe "$1") || return $?
+	if [ -z "$recipe" ] || [ "$recipe" == "-" ]; then
+		eprintf "Error: No recipe for image: $1\n"
+		return 1
+	fi
+
+	rv=0
+	lock || return $?
+	temp_dir=$(cmd mktemp -d "/tmp/$ME.XXXXXX") || return $?
+	cp $recipe "$temp_dir/recipe.metadata"
+	(set -o pipefail; docker save $1 | gzip >"$temp_dir/image.metadata")
+	rv=$?
+	tar -cf $2 "$temp_dir/image.metadata" "$temp_dir/recipe.metadata" \
+		>/dev/null 2>&1
+	rv=$(($rv + $?))
+	rm -rf $temp_dir
+	unlock || return $?
+
+	return $rv
+}
+#===============================================================================
+
+# Loads an image from the compressed archive (specified as the first argument
+# $1) into the local Docker repository and also extracts its recipe
+# configuration file from the compressed archive into a location specified as
+# the second argument ($2). Returns 0 on success, 1 on error.
+whale_load() {
+	local image size recipe temp_dir choice
+	if [ ! -f "$1" ] || [ -z "$2" ]; then
+		eprintf "Usage: load ARCHIVE PATH_TO_EXTRACT_RECIPE\n"
+		return 1
+	fi
+	if [[ $2 == *"/" ]]; then
+		eprintf "Error: Recipe file name not specified in path: $2\n"
+		return 1
+	fi
+
+	temp_dir=$(cmd mktemp -d "/tmp/$ME.XXXXXX") || return $?
+	tar -xf $1 -C $temp_dir --strip-components=2
+
+	# Unpacks an image name from the archive (first tag from 'RepoTags').
+	image=$(tar -xOzf "$temp_dir/image.metadata" manifest.json \
+		| tr ',' '\n' | grep "RepoTags" \
+		| sed 's|.*\["\(.*\)".*|\1|' | sed 's|:.*||')
+	if [ -z "$image" ]; then
+		eprintf "Error: Unable to extract image name from archive: $1\n"
+		rm -rf $temp_dir
+		return 1
+	fi
+	whale_list | grep $image >/dev/null
+	if [ $? -eq 0 ]; then
+		eprintf "Image provided by the archive already exists: $image\n"
+		rm -rf $temp_dir
+		return 1
+	fi
+
+	# Loads an image from the ARCHIVE to the local Docker repository.
+	(set -o pipefail; gzip -cd "$temp_dir/image.metadata" | docker load 1>&2)
+	if [ $? -ne 0 ]; then
+		rm -rf $temp_dir
+		return 1
+	fi
+
+	# Copies the recipe from the ARCHIVE to the specified location; if
+	# recipe $2 exists, asks if it should be overwritten.
+	choice="y"
+	if [ -f "$2" ]; then
+		eprintf "$2 already exists, overwrite [y/N]: "
+		read -r choice
+	fi
+	if [ "$choice" == "y" ]; then
+		cp "$temp_dir/recipe.metadata" $2
+		if [ $? -ne 0 ]; then
+			rm -rf $temp_dir
+			return 1
+		fi
+	fi
+
+	rm -rf $temp_dir
+
+	# Adds record for the extracted image into the $WHALE_CONF file.
+	size=$(get_docker_image_size "$image") || return $?
+	recipe="$(cd $(dirname $2); pwd)/$(basename $2)"
+	lock || return $?
+	file_insert_first_line "$image $size $recipe" "$WHALE_CONF" || return $?
+	unlock || return $?
+
+	eprintf "Please update the 'plugin' and the 'tests_root_dir'\n"
+	eprintf "parameters of the '$2'\n"
+	eprintf "recipe file if these parameters have changed.\n"
+
+	eprintf "Test image loaded: "
+	printf "$image\n"
+
+	return 0
+}
+#===============================================================================
+
+# Removes one or more test images including all of their containers, or removes
+# one or more containers specified as aruments.
+# Returns 0 on success, 1 on error.
+whale_rm() {
+	if [ -z "$1" ]; then
+		eprintf "Usage: rm IMAGE|CONTAINER [IMAGE|CONTAINER...]\n"
+		return 1
+	fi
+	local image cont
+
+	whale_export_conf || return 1
+
+	# Find out if other instances of $ME are running, if yes do not
+	# remove anything and return.
+	local inst; inst=$(number_of_instances "$ME") || return $?
+	if [ $inst -gt 1 ]; then
+		inst=$(($inst - 1))
+		printf "There are $inst other instances of $ME still running\n"
+		printf "Skipping removal\n"
+		return 0
+	fi
+
+	lock || return $?
+	for arg in "$@"; do
+		# First, try removing container.
+		docker rm -f $arg 2>/dev/null
+
+		# If $arg wasn't container, remove it as an image with all of
+		# its containers, but first check if it exists in $WHALE_CONF.
+		image=$(tail -n +2 "$WHALE_CONF" | grep "$arg " | awk '{print $1}')
+		if [ ! -z "$image" ]; then
+			# Removes all containers derived from the $image.
+			cont=$(docker ps -aq --filter "label=$WHALE_IMG_LABEL=$image")
+			if [ ! -z "$cont" ]; then
+				docker rm -f $cont 2>/dev/null
+			fi
+			docker rmi $image 2>/dev/null || continue
+			sed -i "\|$image .*|d" "$WHALE_CONF"
+		fi
+	done
+	unlock || return $?
+
+	return 0
+}
+#===============================================================================
+
+# Removes either all images and their containers ('all' argument) or only
+# containers ('running' argument). Applies only to images and containers which
+# are managed by $ME. Also removal is skipped if any other instances of $ME
+# are running.
+# Returns 0 on success, 1 on error.
+whale_rm_all() {
+	if [ "$1" == "all" ] || [ "$1" == "running" ]; then
+		local image cont lineno
+
+		whale_export_conf || return 1
+
+		# Find out if other instances of $ME are running, if yes do not
+		# remove anything and return.
+		local inst; inst=$(number_of_instances "$ME") || return $?
+		if [ $inst -gt 1 ]; then
+			inst=$(($inst - 1))
+			printf "There are $inst other instances of $ME still running\n"
+			printf "Skipping removal\n"
+			return 0
+		fi
+
+		cont=$(docker ps -aq --filter "label=$WHALE_LABEL")
+		if [ ! -z "$cont" ]; then
+			docker rm -f $cont 2>/dev/null
+		fi
+
+		if [ "$1" == "all" ]; then
+			lineno=1
+			lock || return $?
+			while read -r line; do
+				# Skips the first line - a path to the plugin.
+				if [ $lineno -eq 1 ]; then
+					lineno=$(($lineno + 1))
+					continue
+				fi
+				image=$(echo "$line" | awk '{print $1}')
+				docker rmi $image 2>/dev/null
+				sed -i "\|$image .*|d" "$WHALE_CONF"
+			done <"$WHALE_CONF"
+			unlock || return $?
+		fi
+	else
+		eprintf "Usage: rm-all all|running\n"
+		return 1
+	fi
+
+	return 0
+}
+#===============================================================================
+
+
+main() {
+	if [ "$1" == "make-conf" ]; then
+		shift 1
+		whale_make_conf "$@" || return $?
+	elif [ "$1" == "setup" ]; then
+		shift 1
+		whale_call_plugin_function "$PLUGIN_SETUP" "$@" || return $?
+	elif [ "$1" == "info" ]; then
+		shift 1
+		whale_info "$@" || return $?
+	elif [ "$1" == "run" ]; then
+		shift 1
+		whale_call_plugin_function "$PLUGIN_RUN" "$@" || return $?
+	elif [ "$1" == "status" ]; then
+		shift 1
+		whale_call_plugin_function "$PLUGIN_STATUS" "$@" || return $?
+	elif [ "$1" == "diff" ]; then
+		shift 1
+		whale_diff "$@" || return $?
+	elif [ "$1" == "analyze" ]; then
+		shift 1
+		whale_analyze "$@" || return $?
+	elif [ "$1" == "save" ]; then
+		shift 1
+		whale_save "$@" || return $?
+	elif [ "$1" == "load" ]; then
+		shift 1
+		whale_load "$@" || return $?
+	elif [ "$1" == "rm" ]; then
+		shift 1
+		whale_rm "$@" || return $?
+	elif [ "$1" == "rm-all" ]; then
+		shift 1
+		whale_rm_all "$@" || return $?
+	elif [ "$1" == "help" ]; then
+		whale_print_help
+	else
+		if [ ! -z "$1" ]; then
+			eprintf "Unknown command: $1\n"
+		fi
+		whale_print_help
+		return 1
+	fi
+	return 0
+}
+
+main "$@"
